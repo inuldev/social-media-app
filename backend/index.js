@@ -1,8 +1,12 @@
+require("dotenv").config();
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
-require("dotenv").config();
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const compression = require("compression");
 const connectDb = require("./config/db");
+const mongoose = require("mongoose");
 
 const authRoute = require("./routes/authRoute");
 const postRoute = require("./routes/postRoute");
@@ -10,8 +14,25 @@ const userRoute = require("./routes/userRoute");
 const passport = require("./controllers/googleController");
 const { initScheduledTasks } = require("./utils/scheduledTasks");
 
+// Validate required environment variables
+const requiredEnvVars = ["MONGO_URI", "JWT_SECRET", "FRONTEND_URL"];
+const missingEnvVars = requiredEnvVars.filter((envVar) => !process.env[envVar]);
+if (missingEnvVars.length) {
+  console.error("Missing required environment variables:", missingEnvVars);
+  process.exit(1);
+}
+
 const app = express();
 
+// Optimize compression for Vercel
+app.use(
+  compression({
+    level: 6, // Balanced between compression and speed
+    threshold: 10 * 1024, // Only compress responses above 10KB
+  })
+);
+
+// CORS configuration optimized for Vercel
 const corsOptions = {
   origin: process.env.FRONTEND_URL || "http://localhost:3000",
   credentials: true,
@@ -22,87 +43,139 @@ const corsOptions = {
     "X-Requested-With",
     "Accept",
   ],
-  maxAge: 600, // 10 minutes
+  maxAge: 600,
   exposedHeaders: ["Content-Length", "Content-Type"],
 };
 
-// Log CORS configuration
-console.log(
-  `CORS configured with origin: ${
-    process.env.FRONTEND_URL || "http://localhost:3000"
-  }`
-);
-
-// Apply CORS before other middleware
 app.use(cors(corsOptions));
 
-// Set appropriate payload limits
-app.use(express.json({ limit: "40mb" }));
-app.use(express.urlencoded({ extended: true, limit: "40mb" }));
+// Optimized request logging for production
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`${req.method} ${req.path} - ${new Date().toISOString()}`);
+  }
+  next();
+});
 
+// Payload limits adjusted for Vercel hobby plan
+app.use(express.json({ limit: "4mb" }));
+app.use(express.urlencoded({ extended: true, limit: "4mb" }));
+
+// Database connection management
 let isConnected = false;
 let connectionRetries = 0;
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;
 
 const connectToDatabase = async () => {
   if (!isConnected && connectionRetries < MAX_RETRIES) {
     try {
       await connectDb();
       isConnected = true;
-      connectionRetries = 0; // Reset retries on successful connection
-      console.log("Database connected successfully");
+      connectionRetries = 0;
 
-      // Initialize scheduled tasks after database connection
-      initScheduledTasks();
+      // Initialize scheduled tasks only in production
+      if (process.env.NODE_ENV === "production") {
+        initScheduledTasks();
+      }
     } catch (error) {
       connectionRetries++;
       console.error(
         `Database connection attempt ${connectionRetries}/${MAX_RETRIES} failed:`,
-        error.message
+        error
       );
       if (connectionRetries >= MAX_RETRIES) {
-        console.error(
-          "Maximum connection retries reached. Please check your database configuration."
-        );
+        throw new Error("Database connection failed after maximum retries");
       }
     }
   }
 };
 
-// Connect to database on startup
-connectToDatabase();
+// Initialize database connection
+connectToDatabase().catch(console.error);
 
-// Middleware to ensure database connection on each request
+// Middleware to ensure database connection with timeout
 app.use(async (req, res, next) => {
-  if (!isConnected) {
-    await connectToDatabase();
+  try {
+    if (!isConnected) {
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error("Database connection timeout")),
+          5000
+        );
+      });
+      await Promise.race([connectToDatabase(), timeoutPromise]);
+    }
+    next();
+  } catch (error) {
+    next(error);
   }
-  next();
 });
 
+// Security middleware
 app.use(cookieParser());
+app.use(
+  helmet({
+    contentSecurityPolicy:
+      process.env.NODE_ENV === "production" ? undefined : false,
+  })
+);
+app.use(helmet.noSniff());
+app.use(helmet.xssFilter());
+app.use(helmet.hidePoweredBy());
 app.use(passport.initialize());
+
+// Rate limiting adjusted for Vercel
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: {
+    status: "error",
+    message: "Too many requests, please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(limiter);
+
+// Request timeout middleware
+app.use((req, res, next) => {
+  res.setTimeout(8000, () => {
+    res.status(408).json({
+      status: "error",
+      message: "Request timeout",
+    });
+  });
+  next();
+});
 
 // Routes
 app.use("/auth", authRoute);
 app.use("/users", postRoute);
 app.use("/users", userRoute);
 
-// Health check endpoint
+// Health check optimized for Vercel
 app.get("/", (req, res) => {
-  res.json({ message: "Backend API is running" });
+  res.json({
+    status: "success",
+    message: "API is running",
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// Error handling middleware
+// Optimized error handling
 app.use((err, req, res, next) => {
-  console.error("Error occurred:", {
-    message: err.message,
-    stack: err.stack,
-    path: req.path,
-    method: req.method,
-  });
+  // Log errors only in development
+  if (process.env.NODE_ENV !== "production") {
+    console.error("Error occurred:", {
+      message: err.message,
+      stack: err.stack,
+      path: req.path,
+      method: req.method,
+    });
+  }
 
-  // Handle specific error types
+  // Handle specific errors
   if (err.name === "ValidationError") {
     return res.status(400).json({
       status: "error",
@@ -123,17 +196,11 @@ app.use((err, req, res, next) => {
   res.status(err.statusCode || 500).json({
     status: "error",
     message: err.message || "Internal server error",
-    error:
-      process.env.NODE_ENV === "development"
-        ? {
-            stack: err.stack,
-            ...err,
-          }
-        : undefined,
+    ...(process.env.NODE_ENV !== "production" && { stack: err.stack }),
   });
 });
 
-// Handle 404
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     status: "error",
@@ -141,9 +208,21 @@ app.use((req, res) => {
   });
 });
 
+// Server initialization
 if (process.env.NODE_ENV !== "production") {
   const PORT = process.env.PORT || 8000;
-  app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+  app.listen(PORT, () =>
+    console.log(`Development server running on port ${PORT}`)
+  );
 }
+
+// Graceful shutdown handler
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received. Shutting down gracefully...");
+  mongoose.connection.close(false, () => {
+    console.log("MongoDB connection closed");
+    process.exit(0);
+  });
+});
 
 module.exports = app;
